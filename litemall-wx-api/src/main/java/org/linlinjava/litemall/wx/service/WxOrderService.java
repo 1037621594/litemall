@@ -1,5 +1,8 @@
 package org.linlinjava.litemall.wx.service;
 
+import com.alipay.api.AlipayClient;
+import com.alipay.api.DefaultAlipayClient;
+import com.alipay.api.request.AlipayTradePagePayRequest;
 import com.github.binarywang.wxpay.bean.notify.WxPayNotifyResponse;
 import com.github.binarywang.wxpay.bean.notify.WxPayOrderNotifyResult;
 import com.github.binarywang.wxpay.bean.order.WxPayMpOrderResult;
@@ -8,7 +11,6 @@ import com.github.binarywang.wxpay.bean.result.BaseWxPayResult;
 import com.github.binarywang.wxpay.constant.WxPayConstants;
 import com.github.binarywang.wxpay.exception.WxPayException;
 import com.github.binarywang.wxpay.service.WxPayService;
-import com.github.pagehelper.PageInfo;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -27,6 +29,7 @@ import org.linlinjava.litemall.db.util.CouponUserConstant;
 import org.linlinjava.litemall.db.util.OrderHandleOption;
 import org.linlinjava.litemall.db.util.OrderUtil;
 import org.linlinjava.litemall.core.util.IpUtil;
+import org.linlinjava.litemall.wx.config.AlipayConfig;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -37,10 +40,7 @@ import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import static org.linlinjava.litemall.wx.util.WxResponseCode.*;
 
@@ -120,33 +120,31 @@ public class WxOrderService {
      * @param limit     分页大小
      * @return 订单列表
      */
-    public Object list(Integer userId, Integer showType, Integer page, Integer limit) {
+    public Object list(Integer userId, Integer showType, Integer page, Integer limit, String sort, String order) {
         if (userId == null) {
             return ResponseUtil.unlogin();
         }
 
         List<Short> orderStatus = OrderUtil.orderStatus(showType);
-        List<LitemallOrder> orderList = orderService.queryByOrderStatus(userId, orderStatus, page, limit);
-        long count = PageInfo.of(orderList).getTotal();
-        int totalPages = (int) Math.ceil((double) count / limit);
+        List<LitemallOrder> orderList = orderService.queryByOrderStatus(userId, orderStatus, page, limit, sort, order);
 
         List<Map<String, Object>> orderVoList = new ArrayList<>(orderList.size());
-        for (LitemallOrder order : orderList) {
+        for (LitemallOrder o : orderList) {
             Map<String, Object> orderVo = new HashMap<>();
-            orderVo.put("id", order.getId());
-            orderVo.put("orderSn", order.getOrderSn());
-            orderVo.put("actualPrice", order.getActualPrice());
-            orderVo.put("orderStatusText", OrderUtil.orderStatusText(order));
-            orderVo.put("handleOption", OrderUtil.build(order));
+            orderVo.put("id", o.getId());
+            orderVo.put("orderSn", o.getOrderSn());
+            orderVo.put("actualPrice", o.getActualPrice());
+            orderVo.put("orderStatusText", OrderUtil.orderStatusText(o));
+            orderVo.put("handleOption", OrderUtil.build(o));
 
-            LitemallGroupon groupon = grouponService.queryByOrderId(order.getId());
+            LitemallGroupon groupon = grouponService.queryByOrderId(o.getId());
             if (groupon != null) {
                 orderVo.put("isGroupin", true);
             } else {
                 orderVo.put("isGroupin", false);
             }
 
-            List<LitemallOrderGoods> orderGoodsList = orderGoodsService.queryByOid(order.getId());
+            List<LitemallOrderGoods> orderGoodsList = orderGoodsService.queryByOid(o.getId());
             List<Map<String, Object>> orderGoodsVoList = new ArrayList<>(orderGoodsList.size());
             for (LitemallOrderGoods orderGoods : orderGoodsList) {
                 Map<String, Object> orderGoodsVo = new HashMap<>();
@@ -162,12 +160,7 @@ public class WxOrderService {
             orderVoList.add(orderVo);
         }
 
-        Map<String, Object> result = new HashMap<>();
-        result.put("count", count);
-        result.put("data", orderVoList);
-        result.put("totalPages", totalPages);
-
-        return ResponseUtil.ok(result);
+        return ResponseUtil.okList(orderVoList, orderList);
     }
 
     /**
@@ -326,7 +319,7 @@ public class WxOrderService {
         BigDecimal integralPrice = new BigDecimal(0.00);
 
         // 订单费用
-        BigDecimal orderTotalPrice = checkedGoodsPrice.add(freightPrice).subtract(couponPrice);
+        BigDecimal orderTotalPrice = checkedGoodsPrice.add(freightPrice).subtract(couponPrice).max(new BigDecimal(0.00));
         // 最终支付费用
         BigDecimal actualPrice = orderTotalPrice.subtract(integralPrice);
 
@@ -360,6 +353,9 @@ public class WxOrderService {
         orderService.add(order);
         orderId = order.getId();
 
+        //保存所有商品货品表id（用于删除购物车里订单商品商品）
+        List<Integer> productIds=new ArrayList<>();
+
         // 添加订单商品表项
         for (LitemallCart cartGoods : checkedGoodsList) {
             // 订单商品
@@ -376,10 +372,11 @@ public class WxOrderService {
             orderGoods.setAddTime(LocalDateTime.now());
 
             orderGoodsService.add(orderGoods);
+            productIds.add(cartGoods.getProductId());
         }
 
-        // 删除购物车里面的商品信息
-        cartService.clearGoods(userId);
+        // 删除购物车里面的订单商品
+        cartService.delete(productIds,userId);
 
         // 商品货品数量减少
         for (LitemallCart checkGoods : checkedGoodsList) {
@@ -532,40 +529,64 @@ public class WxOrderService {
             return ResponseUtil.fail(AUTH_OPENID_UNACCESS, "订单不能支付");
         }
         WxPayMpOrderResult result = null;
+        String resultstr="";//支付宝返回表单
         try {
-            WxPayUnifiedOrderRequest orderRequest = new WxPayUnifiedOrderRequest();
-            orderRequest.setOutTradeNo(order.getOrderSn());
-            orderRequest.setOpenid(openid);
-            orderRequest.setBody("订单：" + order.getOrderSn());
+          //  WxPayUnifiedOrderRequest orderRequest = new WxPayUnifiedOrderRequest();
+          //  orderRequest.setOutTradeNo(order.getOrderSn());
+          //  orderRequest.setOpenid(openid);
+         //   orderRequest.setBody("订单：" + order.getOrderSn());
             // 元转成分
-            int fee = 0;
-            BigDecimal actualPrice = order.getActualPrice();
-            fee = actualPrice.multiply(new BigDecimal(100)).intValue();
-            orderRequest.setTotalFee(fee);
-            orderRequest.setSpbillCreateIp(IpUtil.getIpAddr(request));
-
-            result = wxPayService.createOrder(orderRequest);
+         //   int fee = 0;
+         //   BigDecimal actualPrice = order.getActualPrice();
+         //   fee = actualPrice.multiply(new BigDecimal(100)).intValue();
+         //   orderRequest.setTotalFee(fee);
+        //    orderRequest.setSpbillCreateIp(IpUtil.getIpAddr(request));
+//
+         //   result = wxPayService.createOrder(orderRequest);
 
             //缓存prepayID用于后续模版通知
-            String prepayId = result.getPackageValue();
-            prepayId = prepayId.replace("prepay_id=", "");
-            LitemallUserFormid userFormid = new LitemallUserFormid();
-            userFormid.setOpenid(user.getWeixinOpenid());
-            userFormid.setFormid(prepayId);
-            userFormid.setIsprepay(true);
-            userFormid.setUseamount(3);
-            userFormid.setExpireTime(LocalDateTime.now().plusDays(7));
-            formIdService.addUserFormid(userFormid);
+           // String prepayId = result.getPackageValue();
+           // prepayId = prepayId.replace("prepay_id=", "");
+//            LitemallUserFormid userFormid = new LitemallUserFormid();
+//            userFormid.setOpenid(user.getWeixinOpenid());
+//            userFormid.setFormid(prepayId);
+//            userFormid.setIsprepay(true);
+//            userFormid.setUseamount(3);
+//            userFormid.setExpireTime(LocalDateTime.now().plusDays(7));
+//            formIdService.addUserFormid(userFormid);
+            //获得初始化的AlipayClient
+            AlipayClient alipayClient = new DefaultAlipayClient(AlipayConfig.gatewayUrl, AlipayConfig.app_id, AlipayConfig.merchant_private_key, "json", AlipayConfig.charset, AlipayConfig.alipay_public_key, AlipayConfig.sign_type);
+
+            //设置请求参数
+            AlipayTradePagePayRequest alipayRequest = new AlipayTradePagePayRequest();
+            alipayRequest.setReturnUrl(AlipayConfig.return_url);
+            alipayRequest.setNotifyUrl(AlipayConfig.notify_url);
+
+            //商户订单号，商户网站订单系统中唯一订单号，必填
+            String out_trade_no = UUID.randomUUID().toString();
+            //付款金额，必填
+            String total_amount = order.getOrderPrice().toString();
+            //订单名称，必填
+            String subject = "测试订单";
+            //商品描述，可空
+            String bodystr = "mall商城商品";
+
+            alipayRequest.setBizContent("{\"out_trade_no\":\""+ out_trade_no +"\","
+                    + "\"total_amount\":\""+ total_amount +"\","
+                    + "\"subject\":\""+ subject +"\","
+                    + "\"body\":\""+ bodystr +"\","
+                    + "\"product_code\":\"FAST_INSTANT_TRADE_PAY\"}");
+             resultstr = alipayClient.pageExecute(alipayRequest).getBody();
 
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseUtil.fail(ORDER_PAY_FAIL, "订单不能支付");
         }
-
+           order.setOrderStatus((short) 201);//测试用，直接支付成功
         if (orderService.updateWithOptimisticLocker(order) == 0) {
             return ResponseUtil.updatedDateExpired();
         }
-        return ResponseUtil.ok(result);
+        return ResponseUtil.ok(resultstr);
     }
 
     /**
